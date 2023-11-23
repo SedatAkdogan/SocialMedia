@@ -6,16 +6,23 @@ import com.bilgeadam.exception.AuthManagerException;
 import com.bilgeadam.exception.ErrorType;
 import com.bilgeadam.manager.UserManager;
 import com.bilgeadam.mapper.AuthMapper;
+import com.bilgeadam.rabbitmq.producer.RegisterMailProducer;
+import com.bilgeadam.rabbitmq.producer.RegisterProducer;
 import com.bilgeadam.repository.AuthRepository;
 import com.bilgeadam.repository.entity.Auth;
 import com.bilgeadam.utility.CodeGenerator;
 import com.bilgeadam.utility.JwtTokenManager;
 import com.bilgeadam.utility.ServiceManager;
+import com.bilgeadam.utility.enums.ERole;
 import com.bilgeadam.utility.enums.EStatus;
+import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 @Service
 public class AuthService extends ServiceManager<Auth,Long> {
@@ -24,25 +31,66 @@ public class AuthService extends ServiceManager<Auth,Long> {
 
     private final UserManager userManager;
     private final JwtTokenManager jwtTokenManager;
+    private final CacheManager cacheManager;
+    private final RegisterProducer registerProducer;
+    private final RegisterMailProducer registerMailProducer;
 
-    public AuthService(AuthRepository authRepository, UserManager userManager, JwtTokenManager jwtTokenManager) {
+    public AuthService(AuthRepository authRepository, UserManager userManager, JwtTokenManager jwtTokenManager, CacheManager cacheManager, RegisterProducer registerProducer, RegisterMailProducer registerMailProducer) {
         super(authRepository);
         this.authRepository = authRepository;
         this.userManager = userManager;
         this.jwtTokenManager = jwtTokenManager;
+        this.cacheManager = cacheManager;
+        this.registerProducer= registerProducer;
+        this.registerMailProducer = registerMailProducer;
     }
 
     @Transactional // metot herhangi bir yerde exception donuyorsa metot icerisinde yapılan butun degisiklikleri geri alır
     public RegisterResponseDto register(RegisterRequestDto dto) {
         Auth auth = AuthMapper.INSTANCE.fromRegisterRequestToAuth(dto);
         auth.setActivationCode(CodeGenerator.generateCode());
-        save(auth);
+
         try {
+            save(auth);
+
+            // rabbitmq ile haberlesme saglayacagız
             userManager.createUser(AuthMapper.INSTANCE.fromAuthToUserCreateRequestDto(auth));
+            registerMailProducer.sendActivationCode(AuthMapper.INSTANCE.fromAuthToRegisterMailModel(auth)); // aktivasyon kodu icin
+            cacheManager.getCache("findbyrole").evict(auth.getRole().toString().toUpperCase());
        }catch (Exception exception){
           //  delete(auth);
            throw  new AuthManagerException(ErrorType.USER_NOT_CREATED);
        }
+
+        return AuthMapper.INSTANCE.fromAuthToRegisterResponse(auth);
+    }
+
+    /**
+     * SPRING_AMQP_DESERIALIZATION_TRUST_ALL rabbitmq register model sayfası serializable
+     * user service ayaga kalkarken bunu sistem ortam degiskenlerine true olarak kaydetmezsen hataya düsüyor.
+     * deserializasyon yapması gerek bu olmadan yapamıyır
+     * @param dto
+     * @return
+     */
+
+    public RegisterResponseDto registerWithRabbitMQ(RegisterRequestDto dto) {
+        Auth auth = AuthMapper.INSTANCE.fromRegisterRequestToAuth(dto);
+        auth.setActivationCode(CodeGenerator.generateCode());
+
+        try {
+            save(auth);
+            // rabbitmq ile haberlesme saglayacagız
+//            registerProducer.sendNewUser(RegisterModel.builder()
+//                            .authId(auth.getId())
+//                            .email(auth.getEmail())
+//                            .username(auth.getUsername())
+//                    .build());
+            registerProducer.sendNewUser(AuthMapper.INSTANCE.fromAuthToRegisterModel(auth));
+            cacheManager.getCache("findbyrole").evict(auth.getRole().toString().toUpperCase());
+        }catch (Exception exception){
+            //  delete(auth);
+            throw  new AuthManagerException(ErrorType.USER_NOT_CREATED);
+        }
 
         return AuthMapper.INSTANCE.fromAuthToRegisterResponse(auth);
     }
@@ -105,5 +153,15 @@ public class AuthService extends ServiceManager<Auth,Long> {
         userManager.delete(id);
         return true;
 
+    }
+
+    public List<Long> findByRole(String role) {
+        ERole myRole;
+        try {
+            myRole = ERole.valueOf(role.toUpperCase(Locale.ENGLISH)); // enum ing oldugu icin admin ADMİN olursa i harfi sıkıntı
+        }catch (Exception e){                                           // o yüzden LocaleEnglish
+            throw new AuthManagerException(ErrorType.ROLE_NOT_FOUND);
+        }
+        return authRepository.findAllByRole(myRole).stream().map(x->x.getId()).collect(Collectors.toList());
     }
 }
